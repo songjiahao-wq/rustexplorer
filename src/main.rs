@@ -478,6 +478,10 @@ struct WinState {
     rename: Option<Rename>,
     tab_rects: Vec<(usize, Rect)>,
     focus_search: bool,
+    /// 搜索框是否持有焦点（上一帧）。
+    /// 不能用「有任意控件获焦」判断是否在输入：egui 的 Tab 导航会把焦点给到文件行/按钮，
+    /// 那样快捷键就全废了。只认真正的文本输入。
+    search_focus: bool,
     close_requested: bool,
     new_windows: Vec<(Tab, Option<[f32; 2]>)>,
     maximized: bool,
@@ -504,6 +508,7 @@ impl WinState {
             rename: None,
             tab_rects: Vec::new(),
             focus_search: false,
+            search_focus: false,
             close_requested: false,
             new_windows: Vec::new(),
             maximized: false,
@@ -794,7 +799,9 @@ fn win_ui(ctx: &egui::Context, w: &mut WinState, shared: &Arc<Shared>) -> bool {
     }
 
     let vp_focus = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-    let editing = ctx.memory(|m| m.focused().is_some());
+    // 只有「真的在输入文字」才屏蔽快捷键（重命名框 / 搜索框）。
+    // 用 focused().is_some() 会把 Tab 导航到的行、按钮也算进来，导致快捷键莫名失效。
+    let editing = w.rename.is_some() || w.search_focus;
 
     // 点击 popup 外部 / Esc → 关闭
     if w.any_popup() && w.rename.is_none() {
@@ -1464,6 +1471,7 @@ fn toolbar(ui: &mut Ui, w: &mut WinState) {
         if want_focus {
             resp.request_focus();
         }
+        w.search_focus = resp.has_focus();
         w.cur_mut().set_query(q);
         ui.add_space(4.0);
         let sb = w.sidebar;
