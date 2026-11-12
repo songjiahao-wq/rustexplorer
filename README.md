@@ -6,6 +6,8 @@
 
 ![RustExplorer 界面](assets/screenshot.jpg)
 
+> 不想自己编译的话，[Releases](https://github.com/songjiahao-wq/rustexplorer/releases) 里有编译好的 exe，下载双击即用。
+
 ## 实测数据
 
 | 项 | RustExplorer | explorer.exe |
@@ -77,7 +79,16 @@ cargo build --release
 powershell -File tools\release.ps1
 ```
 
+连 GitHub Release 一起发（自动读 `Cargo.toml` 版本号建 tag、打附件、写发布说明）：
+
+```powershell
+powershell -File tools\release.ps1 -Release
+powershell -File tools\release.ps1 -Release -Notes docs\v0.2.0.md   # 自定义发布说明
+```
+
 > 顺序不可颠倒：`cargo build` 会把注入的图标冲掉，所以 `patch_icon.py` 必须在编译之后跑。`release.ps1` 已经固定了这个顺序。
+>
+> 发 Release 走本地代理（默认 `http://127.0.0.1:20172`，带分流规则那个端口），可用 `-Proxy` 覆盖。另外中文说明一律走 UTF-8 文件传参，别当命令行参数塞给 git/gh，会被按 GBK 转坏。
 
 ## 技术要点
 
