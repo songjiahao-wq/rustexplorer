@@ -4,6 +4,8 @@
 
 起因很简单——Windows 自带资源管理器占内存、开多目录要靠开一堆窗口。这个项目想验证一件事：**用纯 Rust 自绘 UI，能不能做出一个体积 4 MB、启动 0.3 秒、内存 100 MB 的日常文件管理器。**
 
+![RustExplorer 界面](assets/screenshot.jpg)
+
 ## 实测数据
 
 | 项 | RustExplorer | explorer.exe |
@@ -102,3 +104,7 @@ examples/          一次性验证程序（cliptest：剪贴板读写互通测�
 - 目录不会自动刷新（需 `F5`）；盘符列表只在启动时枚举，热插拔需重启
 - 尚未接入系统文件图标（`SHGetFileInfoW`）
 - 无会话持久化：窗口尺寸、标签、排序每次重启重置
+
+## 许可证
+
+[MIT](LICENSE)
