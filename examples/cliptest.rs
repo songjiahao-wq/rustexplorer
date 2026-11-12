@@ -37,6 +37,10 @@ fn main() {
             None => println!("EMPTY"),
         },
         Some("has") => println!("has_files={}", fs_util::clip_has_files()),
-        _ => println!("usage: cliptest write <path...> [cut] | read | has"),
+        Some("clear") => {
+            fs_util::clip_clear();
+            println!("OK cleared");
+        }
+        _ => println!("usage: cliptest write <path...> [cut] | read | has | clear"),
     }
 }

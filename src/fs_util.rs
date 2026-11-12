@@ -571,7 +571,11 @@ pub fn clip_write_files(paths: &[PathBuf], cut: bool) -> Result<(), String> {
         // 解锁到 0 时 GlobalUnlock 返回 FALSE，这是正常行为，不能当错误
         let _ = GlobalUnlock(hmem);
 
-        OpenClipboard(None).map_err(|e| format!("打开剪贴板失败：{e}"))?;
+        // 别在这里 return：hmem 已经分配了，直接返回会泄漏
+        if let Err(e) = OpenClipboard(None) {
+            let _ = GlobalFree(hmem);
+            return Err(format!("打开剪贴板失败：{e}"));
+        }
         EmptyClipboard().ok();
         let mut ok = SetClipboardData(CF_HDROP.0 as u32, HANDLE(hmem.0)).is_ok();
 
@@ -663,6 +667,22 @@ pub fn clip_read_files() -> Option<(Vec<PathBuf>, bool)> {
 pub fn clip_write_files(_paths: &[PathBuf], _cut: bool) -> Result<(), String> {
     Err("仅 Windows 支持".into())
 }
+
+/// 清空系统剪贴板。剪切 + 粘贴（=移动）成功后要调，
+/// 否则再按一次 Ctrl+V 会去移动已经不在原位的源文件。
+#[cfg(windows)]
+pub fn clip_clear() {
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard};
+    unsafe {
+        if OpenClipboard(None).is_ok() {
+            let _ = EmptyClipboard();
+            let _ = CloseClipboard();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn clip_clear() {}
 
 /// 剪贴板里是否有文件（CF_HDROP）。只做格式检查，不打开剪贴板，开销极小。
 #[cfg(windows)]

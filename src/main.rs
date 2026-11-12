@@ -11,7 +11,7 @@ use eframe::egui::{self, Align, Align2, Color32, FontDefinitions, FontData, Font
     ScrollArea, Sense, StrokeKind, TextEdit, TextStyle, TopBottomPanel, Ui, Vec2, ViewportBuilder,
     ViewportClass, ViewportCommand, ViewportId, Visuals};
 use fs_util::{
-    clip_read_files, clip_write_files, delete_to_recycle, drive_free, drives, fmt_size, fmt_time,
+    clip_clear, clip_read_files, clip_write_files, delete_to_recycle, drive_free, drives, fmt_size, fmt_time,
     home_dir, open_with_default, reveal_in_explorer, same_volume, short_name, spawn_ls, start_job,
     unique_child, CopyOp, FsEntry, JobHandle, LsResult,
 };
@@ -196,6 +196,7 @@ enum SortKey {
     Name,
     Date,
     Size,
+    Type,
 }
 
 struct Tab {
@@ -372,6 +373,11 @@ impl Tab {
                 SortKey::Name => ea.name.to_lowercase().cmp(&eb.name.to_lowercase()),
                 SortKey::Date => ea.mtime.cmp(&eb.mtime),
                 SortKey::Size => ea.size.cmp(&eb.size),
+                // 同类型内部再按名字排，避免同类之间顺序不确定
+                SortKey::Type => ea
+                    .ext
+                    .cmp(&eb.ext)
+                    .then_with(|| ea.name.to_lowercase().cmp(&eb.name.to_lowercase())),
             };
             if desc {
                 o.reverse()
@@ -546,6 +552,10 @@ struct Shared {
     drives: Vec<(String, PathBuf)>,
     quick: Vec<(String, PathBuf)>,
     start: std::time::Instant,
+    /// 盘符剩余空间缓存（路径 → (文案, 采样时间)）。
+    /// GetDiskFreeSpaceExW 是同步调用，休眠的移动硬盘 / 断线的网络盘会把 UI 卡死几秒，
+    /// 所以每个盘 5 秒内只查一次，绝不能放在绘制循环里每帧调。
+    free_cache: Mutex<std::collections::HashMap<PathBuf, (String, f64)>>,
 }
 
 impl Shared {
@@ -570,10 +580,28 @@ impl Shared {
             drives: drives(),
             quick,
             start: std::time::Instant::now(),
+            free_cache: Mutex::new(std::collections::HashMap::new()),
         }
     }
     fn t(&self) -> f64 {
         self.start.elapsed().as_secs_f64()
+    }
+    /// 盘符剩余空间文案；5 秒缓存，避免每帧一次同步系统调用
+    fn free_text(&self, p: &std::path::Path) -> String {
+        let t = self.t();
+        {
+            let c = self.free_cache.lock().unwrap();
+            if let Some((s, at)) = c.get(p) {
+                if t - at < 5.0 {
+                    return s.clone();
+                }
+            }
+        }
+        let s = drive_free(p)
+            .map(|f| format!("剩余 {}", fmt_size(f)))
+            .unwrap_or_default();
+        self.free_cache.lock().unwrap().insert(p.to_path_buf(), (s.clone(), t));
+        s
     }
     fn toast(&self, text: String, err: bool) {
         let t = self.t();
@@ -887,7 +915,8 @@ fn win_ui(ctx: &egui::Context, w: &mut WinState, shared: &Arc<Shared>) -> bool {
         if dst.as_os_str().is_empty() {
             shared.toast("先打开一个文件夹再拖入".into(), true);
         } else {
-            let h = start_job(CopyOp::Copy, dropped, dst, true);
+            // replace=false：外部拖进来的同名文件跳过，绝不静默覆盖（与内部拖拽保持一致）
+            let h = start_job(CopyOp::Copy, dropped, dst, false);
             shared.jobs.lock().unwrap().push(("复制".into(), h));
             w.reload_when_idle = true;
         }
@@ -1768,7 +1797,7 @@ fn content(ui: &mut Ui, w: &mut WinState, shared: &Arc<Shared>) {
     let mut sort_act: Option<SortKey> = None;
     sort_act = sort_act.or(header_cell(ui, Rect::from_min_max(hdr.min, Pos2::new(x_date, hdr.max.y)), "名称", SortKey::Name, w, false));
     sort_act = sort_act.or(header_cell(ui, Rect::from_min_max(Pos2::new(x_date, hdr.min.y), Pos2::new(x_type - 8.0, hdr.max.y)), "修改日期", SortKey::Date, w, true));
-    sort_act = sort_act.or(header_cell(ui, Rect::from_min_max(Pos2::new(x_type - 8.0, hdr.min.y), Pos2::new(x_size - 8.0, hdr.max.y)), "类型", SortKey::Name, w, true));
+    sort_act = sort_act.or(header_cell(ui, Rect::from_min_max(Pos2::new(x_type - 8.0, hdr.min.y), Pos2::new(x_size - 8.0, hdr.max.y)), "类型", SortKey::Type, w, true));
     sort_act = sort_act.or(header_cell(ui, Rect::from_min_max(Pos2::new(x_size - 8.0, hdr.min.y), Pos2::new(hdr.max.x - pad, hdr.max.y)), "大小", SortKey::Size, w, true));
     if let Some(k) = sort_act {
         w.cur_mut().set_sort(k);
@@ -2018,7 +2047,7 @@ fn this_pc(ui: &mut Ui, w: &mut WinState, shared: &Arc<Shared>) {
             ui.painter().text(
                 Pos2::new(rect.min.x + 50.0, rect.center().y + 9.0),
                 Align2::LEFT_CENTER,
-                drive_free(p).map(|f| format!("剩余 {}", fmt_size(f))).unwrap_or_default(),
+                shared.free_text(p),
                 FontId::proportional(11.0),
                 MUTE,
             );
@@ -2348,6 +2377,13 @@ fn paste(ctx: &egui::Context, w: &mut WinState, shared: &Arc<Shared>) {
     let op = if cut { CopyOp::Move } else { CopyOp::Copy };
     let h = start_job(op, srcs, cur, true);
     shared.jobs.lock().unwrap().push((label.to_string(), h));
+    // 后台任务结束后要刷新列表，否则粘贴完看着像没生效
+    w.reload_when_idle = true;
+    // 剪切粘贴 = 移动，Explorer 会把剪贴板清空；不清的话再按一次 Ctrl+V 会去移动已经不存在的源
+    if cut {
+        clip_clear();
+        *shared.clip.lock().unwrap() = (Vec::new(), false);
+    }
     let _ = ctx;
 }
 
@@ -2652,7 +2688,20 @@ fn draw_rename(ctx: &egui::Context, w: &mut WinState, shared: &Arc<Shared>, now:
         let rn = w.rename.take();
         if let Some(rn) = rn {
             if !rn.buf.is_empty() && rn.buf != short_name(&rn.target) {
+                // 文件名里不能带路径分隔符或非法字符，"." ".." 也不行：
+                // 否则 p.join("..\\x") 会把文件挪到父目录，且 Windows 的 rename 会覆盖同名文件
+                let bad = rn.buf.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|'])
+                    || rn.buf == "."
+                    || rn.buf == "..";
+                if bad {
+                    shared.toast("名称里不能包含 \\ / : * ? \" < > |".into(), true);
+                    return;
+                }
                 if let Some(dst) = rn.target.parent().map(|p| p.join(&rn.buf)) {
+                    if dst != rn.target && dst.exists() {
+                        shared.toast("同名文件已存在，未做修改".into(), true);
+                        return;
+                    }
                     match std::fs::rename(&rn.target, &dst) {
                         Ok(()) => {
                             shared.toast("已重命名".into(), false);
