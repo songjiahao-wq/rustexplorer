@@ -7,3 +7,9 @@
 /*.jpg
 /*.png
 /shot*.py
+
+# 本地验收工作区：参考图、抓帧输出、截图脚本
+/refs
+/shots
+/tools/shot_*.py
+__pycache__/

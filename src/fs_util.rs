@@ -180,6 +180,33 @@ pub fn drive_free(_path: &Path) -> Option<u64> {
     None
 }
 
+/// 磁盘总容量 + 可用容量。卷根取 ancestors().last()：任意深路径都能问到所属磁盘。
+#[cfg(windows)]
+pub fn drive_space(path: &Path) -> Option<(u64, u64)> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let root = path.ancestors().last()?;
+    let ws: Vec<u16> = OsStr::new(root)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free = 0u64;
+    let mut total = 0u64;
+    let ok = unsafe { GetDiskFreeSpaceExW(PCWSTR(ws.as_ptr()), Some(&mut free), Some(&mut total), None) };
+    if ok.is_ok() && total > 0 {
+        Some((free, total))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+pub fn drive_space(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
 // ---------------------------------------------------------------- 格式化
 
 pub fn fmt_size(n: u64) -> String {
