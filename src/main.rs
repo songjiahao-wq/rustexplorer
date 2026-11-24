@@ -239,7 +239,7 @@ enum SortKey {
 
 /// 列表里的一行：分组表头（文件夹 / 文件）或真实条目。
 /// 下标指向 entries，分组表头里放的是该组条目数。
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum RowKind {
     DirHeader,
     FileHeader,
@@ -277,9 +277,11 @@ struct Tab {
 impl Tab {
     fn new(path: PathBuf) -> Self {
         let mut t = Tab {
-            path,
-            history: Vec::new(),
-            hi: usize::MAX,
+            // 当前路径本身也进栈，hi 指向它：
+            // 「后退再前进」才能回到原处（旧实现只压旧路径，前进永远无处可去）
+            path: path.clone(),
+            history: vec![path],
+            hi: 0,
             entries: Vec::new(),
             loading: true,
             rx: None,
@@ -365,18 +367,15 @@ impl Tab {
         }
     }
 
+    /// 历史栈：history[hi] 就是当前路径，hi 之前的可以后退、之后的可以前进
     fn navigate(&mut self, p: PathBuf) {
         if self.path == p {
             return;
         }
-        if self.hi < self.history.len() {
-            self.history.truncate(self.hi + 1);
-        }
-        // 后退后再跳转时，当前目录可能已在栈顶：避免重复入栈导致「连按两次后退不动」
-        if self.history.last() != Some(&self.path) {
-            self.history.push(self.path.clone());
-        }
-        self.hi = self.history.len();
+        // 丢弃「前进分支」，再把新目标压到栈顶
+        self.history.truncate(self.hi + 1);
+        self.history.push(p.clone());
+        self.hi = self.history.len() - 1;
         self.path = p;
         self.query.clear();
         self.reload();
@@ -392,8 +391,7 @@ impl Tab {
     }
 
     fn fwd(&mut self) {
-        // hi 初始是 usize::MAX（还没有历史），直接 +1 会溢出
-        if self.hi < self.history.len().saturating_sub(1) {
+        if self.hi + 1 < self.history.len() {
             self.hi += 1;
             let p = self.history[self.hi].clone();
             self.path = p;
@@ -402,10 +400,10 @@ impl Tab {
     }
 
     fn can_back(&self) -> bool {
-        self.hi > 0 && self.hi <= self.history.len()
+        self.hi > 0
     }
     fn can_fwd(&self) -> bool {
-        self.hi < self.history.len().saturating_sub(1)
+        self.hi + 1 < self.history.len()
     }
 
     /// 过滤 + 排序后的 entry 下标序列
@@ -3757,4 +3755,450 @@ fn main() -> eframe::Result {
         opts,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+// ================================================================ 无头测试
+//
+// egui 的 `Context::run` 不吃窗口、不碰 GPU：喂 RawInput、吐 FullOutput。
+// 所以整套界面逻辑都能在 `cargo test` 里跑，不需要前台窗口，也不需要截图。
+//
+// L1  纯逻辑：排序 / 过滤 / 分组行 / 历史栈 / 文本截断     —— 毫秒级
+// L2  无头帧：真跑 win_ui，注入键盘事件，检查图元边界      —— 秒级
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------- 夹具
+
+    struct Fixture {
+        dir: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let mut dir = std::env::temp_dir();
+            dir.push(format!("rx_test_{}_{}", tag, std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::create_dir_all(dir.join("alpha")).unwrap();
+            std::fs::create_dir_all(dir.join("Beta")).unwrap();
+            mkfile(&dir.join("readme.md"), 120);
+            mkfile(&dir.join("notes.txt"), 2_048);
+            mkfile(&dir.join("archive.zip"), 5_000);
+            mkfile(&dir.join("photo.png"), 300_000);
+            Fixture { dir }
+        }
+
+        fn tab(&self) -> Tab {
+            let mut t = Tab::new(self.dir.clone());
+            settle(&mut t);
+            t
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn mkfile(p: &std::path::Path, size: u64) {
+        let f = std::fs::File::create(p).unwrap();
+        f.set_len(size).unwrap();
+    }
+
+    /// 目录扫描走后台线程：测试里同步等它落地
+    fn settle(t: &mut Tab) {
+        for _ in 0..3000 {
+            t.poll();
+            if !t.loading && t.rx.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("目录扫描超时");
+    }
+
+    // ---------------------------------------------------------- L1 纯逻辑
+
+    #[test]
+    fn rows_group_dirs_before_files() {
+        let f = Fixture::new("rows");
+        let mut t = f.tab();
+        let rows = t.rows().to_vec();
+        assert_eq!(rows.len(), 8, "2 目录 + 4 文件 + 2 组头");
+        assert_eq!(rows[0].kind, RowKind::DirHeader);
+        assert_eq!(rows[0].idx, 2, "组头里存的是该组条目数");
+        assert_eq!(rows[3].kind, RowKind::FileHeader);
+        assert_eq!(rows[3].idx, 4);
+        assert_eq!(rows[1..3].len(), rows[0].idx);
+        assert_eq!(rows[4..].len(), rows[3].idx);
+    }
+
+    #[test]
+    fn folding_keeps_header_only() {
+        let f = Fixture::new("fold");
+        let mut t = f.tab();
+        t.fold_dirs = true;
+        t.view_dirty = true;
+        let rows = t.rows().to_vec();
+        assert_eq!(rows.len(), 6, "目录块只剩表头");
+        assert_eq!(rows[0].kind, RowKind::DirHeader);
+        assert_eq!(rows[1].kind, RowKind::FileHeader);
+        assert_eq!(t.visible().len(), 4);
+
+        t.fold_files = true;
+        t.view_dirty = true;
+        assert_eq!(t.rows().len(), 2, "全折叠只剩两个表头");
+        assert!(t.visible().is_empty());
+    }
+
+    #[test]
+    fn query_filters_and_clears_selection() {
+        let f = Fixture::new("query");
+        let mut t = f.tab();
+        t.sel.extend(0..t.entries.len());
+
+        t.set_query("read".into());
+        assert!(t.sel.is_empty(), "过滤后必须清空选中，否则下标会指向别的文件");
+
+        let v = t.view().to_vec();
+        assert_eq!(v.len(), 1);
+        assert_eq!(t.entries[v[0]].name, "readme.md");
+
+        let rows = t.rows().to_vec();
+        assert_eq!(rows.len(), 2, "没有目录命中 → 只有文件组");
+        assert_eq!(rows[0].kind, RowKind::FileHeader);
+        assert_eq!(rows[0].idx, 1);
+    }
+
+    #[test]
+    fn sort_keeps_dirs_first_and_toggles_direction() {
+        let f = Fixture::new("sort");
+        let mut t = f.tab();
+        t.set_sort(SortKey::Size);
+        let v = t.view().to_vec();
+        assert!(t.entries[v[0]].is_dir && t.entries[v[1]].is_dir, "目录恒定在前");
+        let sizes: Vec<u64> = v[2..].iter().map(|&i| t.entries[i].size).collect();
+        assert_eq!(sizes, vec![120, 2_048, 5_000, 300_000]);
+
+        t.set_sort(SortKey::Size); // 同键再点一次 = 反向
+        let v2 = t.view().to_vec();
+        let sizes2: Vec<u64> = v2[2..].iter().map(|&i| t.entries[i].size).collect();
+        assert_eq!(sizes2, vec![300_000, 5_000, 2_048, 120]);
+        assert!(t.entries[v2[0]].is_dir && t.entries[v2[1]].is_dir, "降序时目录仍在前");
+    }
+
+    #[test]
+    fn history_is_safe_from_initial_state() {
+        let f = Fixture::new("nav");
+        let mut t = f.tab();
+        // hi 初始是 usize::MAX：这里曾索引越界 panic
+        t.back();
+        t.fwd();
+        assert_eq!(t.path, f.dir);
+
+        let sub = f.dir.join("alpha");
+        t.navigate(sub.clone());
+        settle(&mut t);
+        assert_eq!(t.path, sub);
+        assert!(t.can_back());
+
+        t.back();
+        settle(&mut t);
+        assert_eq!(t.path, f.dir);
+        assert!(t.can_fwd());
+
+        t.fwd();
+        settle(&mut t);
+        assert_eq!(t.path, sub);
+    }
+
+    #[test]
+    fn truncate_left_keeps_tail() {
+        let p = r"D:\AI_project\workbuddy\projects\rustexplorer\src";
+        let short = truncate_left(p, 60.0);
+        assert!(short.starts_with('…'), "{}", short);
+        assert!(short.ends_with("src"), "尾部要保留：{}", short);
+        assert_eq!(truncate_left("src", 500.0), "src", "放得下就原样返回");
+    }
+
+    #[test]
+    fn crumb_parts_splits_drive_and_unc() {
+        let parts = crumb_parts(&PathBuf::from(r"D:\AI_project\src"));
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].0, "D:");
+        assert_eq!(parts[2].0, "src");
+        // UNC 根不应该崩
+        let _ = crumb_parts(&PathBuf::from("\\\\"));
+    }
+
+    // ---------------------------------------------------------- L2 无头帧
+
+    fn headless_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        setup_fonts(&ctx);
+        ctx
+    }
+
+    fn raw(size: Vec2, time: f64) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+            time: Some(time),
+            ..Default::default()
+        }
+    }
+
+    fn key_ev(k: Key, m: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: m,
+        }
+    }
+
+    fn ctrl_mod() -> egui::Modifiers {
+        // shortcuts() 用的是 i.modifiers.command（Windows 上等价于 ctrl），两个都要给
+        egui::Modifiers { ctrl: true, command: true, ..Default::default() }
+    }
+
+    struct Harness {
+        ctx: egui::Context,
+        w: WinState,
+        sh: Arc<Shared>,
+        size: Vec2,
+        t: f64,
+    }
+
+    impl Harness {
+        fn new(dir: PathBuf, size: Vec2) -> Self {
+            let mut h = Harness {
+                ctx: headless_ctx(),
+                w: WinState::new(ViewportId::ROOT, dir),
+                sh: Arc::new(Shared::new()),
+                size,
+                t: 0.0,
+            };
+            // 头两帧：字体布局发生效、后台目录扫描落地
+            for _ in 0..3 {
+                h.frame();
+            }
+            for tab in h.w.tabs.iter_mut() {
+                settle(tab);
+            }
+            h.frame();
+            h
+        }
+
+        fn frame(&mut self) -> egui::FullOutput {
+            self.t += 1.0 / 60.0;
+            let (size, time) = (self.size, self.t);
+            let Self { ctx, w, sh, .. } = self;
+            ctx.run(raw(size, time), |c| {
+                win_ui(c, w, sh);
+            })
+        }
+
+        /// 推一帧，带上若干输入事件。
+        /// 事件里的 modifiers 同时写进 RawInput：egui 的 `i.modifiers` 读的是帧级状态，
+        /// 只塞 Event::Key 的 modifiers 是拦不到 `i.modifiers.command` 的。
+        fn input(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
+            self.t += 1.0 / 60.0;
+            let mods = events
+                .iter()
+                .find_map(|e| match e {
+                    egui::Event::Key { modifiers, .. } => Some(*modifiers),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let mut r = raw(self.size, self.t);
+            r.modifiers = mods;
+            r.events = events;
+            let Self { ctx, w, sh, .. } = self;
+            ctx.run(r, |c| {
+                win_ui(c, w, sh);
+            })
+        }
+    }
+
+    fn walk_shapes(s: &egui::Shape, out: &mut Vec<Rect>) {
+        use egui::Shape as S;
+        match s {
+            S::Vec(v) => {
+                for x in v {
+                    walk_shapes(x, out);
+                }
+            }
+            S::Rect(r) => out.push(r.rect),
+            S::Text(t) => out.push(Rect::from_min_size(t.pos, t.galley.size())),
+            S::Circle(c) => out.push(Rect::from_center_size(c.center, Vec2::splat(c.radius))),
+            S::LineSegment { points, .. } => out.push(Rect::from_two_pos(points[0], points[1])),
+            S::Path(p) => {
+                if !p.points.is_empty() {
+                    out.push(Rect::from_points(&p.points));
+                }
+            }
+            S::Mesh(m) => {
+                if let Some(first) = m.vertices.first() {
+                    let mut r = Rect::from_min_max(first.pos, first.pos);
+                    for v in &m.vertices {
+                        r.extend_with(v.pos);
+                    }
+                    out.push(r);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 布局体检：
+    /// - 每个 ClipShape 的裁剪框必须在窗口内 —— 超了说明整个面板被推到屏外
+    /// - 每个图元必须与窗口有交集 —— 完全在窗外的元素用户根本看不见
+    ///
+    /// 刻意不要求「图元 bbox 全在窗口内」：长文本被 clip 裁掉是正常渲染（资源管理器
+    /// 本来就会把超长名字切在右边界），那种情况要求 bbox 不越界只会制造假警报。
+    fn assert_inside(out: &egui::FullOutput, size: Vec2, tag: &str) {
+        let screen = Rect::from_min_size(Pos2::ZERO, size);
+        let mut n_shape = 0usize;
+        let mut clip_bad: Vec<Rect> = Vec::new();
+        let mut invisible: Vec<Rect> = Vec::new();
+        for cs in &out.shapes {
+            n_shape += 1;
+            if !screen.expand(1.0).contains_rect(cs.clip_rect) {
+                clip_bad.push(cs.clip_rect);
+            }
+            let mut boxes = Vec::new();
+            walk_shapes(&cs.shape, &mut boxes);
+            for b in boxes {
+                if !screen.intersects(b) {
+                    invisible.push(b);
+                }
+            }
+        }
+        assert!(n_shape > 60, "[{}] 图元过少（{}），界面可能没画出来", tag, n_shape);
+        assert!(
+            clip_bad.is_empty(),
+            "[{}] {} 个裁剪框越出窗口，前几个 {:?}",
+            tag,
+            clip_bad.len(),
+            &clip_bad[..clip_bad.len().min(4)]
+        );
+        assert!(
+            invisible.is_empty(),
+            "[{}] {} 个图元完全在窗口外，前几个 {:?}",
+            tag,
+            invisible.len(),
+            &invisible[..invisible.len().min(4)]
+        );
+    }
+
+    #[test]
+    fn frame_renders_inside_window() {
+        let f = Fixture::new("frame");
+        let mut h = Harness::new(f.dir.clone(), Vec2::new(1100.0, 680.0));
+        let out = h.frame();
+        assert_inside(&out, h.size, "1100x680");
+    }
+
+    #[test]
+    fn narrow_window_renders_inside() {
+        let f = Fixture::new("narrow");
+        // 最小尺寸：面包屑要折叠、命令条不能重叠
+        let mut h = Harness::new(f.dir.clone(), Vec2::new(780.0, 600.0));
+        let out = h.frame();
+        assert_inside(&out, h.size, "780x600");
+    }
+
+    #[test]
+    fn ctrl_l_opens_address_bar_and_esc_closes() {
+        let f = Fixture::new("addr");
+        let mut h = Harness::new(f.dir.clone(), Vec2::new(1100.0, 680.0));
+        assert!(h.w.addr.is_none());
+
+        h.input(vec![key_ev(Key::L, ctrl_mod())]);
+        let txt = h.w.addr.clone().expect("Ctrl+L 应进入地址编辑");
+        assert_eq!(PathBuf::from(txt), f.dir, "地址栏应预填当前路径");
+
+        h.input(vec![key_ev(Key::Escape, egui::Modifiers::default())]);
+        assert!(h.w.addr.is_none(), "Esc 应退出地址编辑");
+    }
+
+    #[test]
+    fn ctrl_a_selects_only_visible_rows() {
+        let f = Fixture::new("selall");
+        let mut h = Harness::new(f.dir.clone(), Vec2::new(1100.0, 680.0));
+        // 折叠文件组：可见的只剩 2 个目录
+        h.w.cur_mut().fold_files = true;
+        h.w.cur_mut().view_dirty = true;
+        h.frame();
+
+        h.input(vec![key_ev(Key::A, ctrl_mod())]);
+        assert_eq!(h.w.cur().sel.len(), 2, "Ctrl+A 只能选可见行，折叠的不算");
+        assert!(h.w.cur().sel.iter().all(|&i| h.w.cur().entries[i].is_dir));
+    }
+
+    #[test]
+    fn arrow_down_skips_group_header() {
+        let f = Fixture::new("arrow");
+        let mut h = Harness::new(f.dir.clone(), Vec2::new(1100.0, 680.0));
+        assert!(h.w.cur().sel.is_empty());
+
+        h.input(vec![key_ev(Key::ArrowDown, egui::Modifiers::default())]);
+        let sel: Vec<usize> = h.w.cur().sel.iter().copied().collect();
+        assert_eq!(sel.len(), 1, "方向键应选中恰好一行");
+        assert!(h.w.cur().entries[sel[0]].is_dir, "第一行是文件夹，不能落在组头上");
+    }
+
+    #[test]
+    fn ctrl_i_and_ctrl_b_toggle_panels() {
+        let f = Fixture::new("panels");
+        let mut h = Harness::new(f.dir.clone(), Vec2::new(1100.0, 680.0));
+        assert!(h.w.details && h.w.sidebar);
+
+        h.input(vec![key_ev(Key::I, ctrl_mod())]);
+        assert!(!h.w.details);
+        h.input(vec![key_ev(Key::I, ctrl_mod())]);
+        assert!(h.w.details);
+
+        h.input(vec![key_ev(Key::B, ctrl_mod())]);
+        assert!(!h.w.sidebar);
+        h.input(vec![key_ev(Key::B, ctrl_mod())]);
+        assert!(h.w.sidebar);
+    }
+
+    #[test]
+    fn search_typing_filters_list() {
+        let f = Fixture::new("typing");
+        let mut h = Harness::new(f.dir.clone(), Vec2::new(1100.0, 680.0));
+        // 直接把查询塞进去，走和 UI 相同的入口
+        h.w.cur_mut().set_query("notes".into());
+        let out = h.frame();
+        assert_inside(&out, h.size, "搜索过滤");
+        assert_eq!(h.w.cur_mut().view().len(), 1);
+    }
+
+    #[test]
+    fn this_pc_view_renders_without_panic() {
+        let mut h = Harness::new(PathBuf::from("\\\\"), Vec2::new(1100.0, 680.0));
+        let out = h.frame();
+        assert_eq!(h.w.cur().title(), "此电脑");
+        assert_inside(&out, h.size, "此电脑");
+    }
+
+    #[test]
+    fn empty_folder_shows_empty_state() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("rx_test_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut h = Harness::new(dir.clone(), Vec2::new(1100.0, 680.0));
+        let out = h.frame();
+        assert!(h.w.cur_mut().rows().is_empty(), "空目录不该有分组表头");
+        assert_inside(&out, h.size, "空目录");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

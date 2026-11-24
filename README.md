@@ -123,6 +123,24 @@ powershell -File tools\release.ps1 -Release -Notes docs\v0.2.0.md   # 自定义�
 >
 > 发 Release 走本地代理（默认 `http://127.0.0.1:20172`，带分流规则那个端口），可用 `-Proxy` 覆盖。另外中文说明一律走 UTF-8 文件传参，别当命令行参数塞给 git/gh，会被按 GBK 转坏。
 
+## 测试
+
+界面逻辑全部可无头运行：egui 的 `Context::run` 不需要窗口、不碰 GPU，喂 `RawInput`、吐 `FullOutput`，所以 `cargo test` 就能验证布局与交互，不必截图、不必占用前台。
+
+```powershell
+cargo test        # 16 个用例，约 0.3 秒
+```
+
+| 层 | 覆盖内容 |
+|---|---|
+| 纯逻辑 | 分组行生成、分组折叠、搜索过滤（含清空选中）、排序方向、历史栈前进/后退、路径左截断 |
+| 无头帧 | 真实跑 `win_ui`：注入 `Ctrl+L` / `Ctrl+I` / `Ctrl+B` / `Ctrl+A` / `↓`，断言地址栏开合、面板切换、选中范围、图元不出界 |
+
+两个刻意的取舍：
+
+- **不要求「每个图元都在窗口内」**。长文件名被 clip 在右边界是资源管理器的正常行为，按 bbox 判越界只会制造假警报。真正的判据是「裁剪框不越界」+「图元与窗口至少有交集」——后者能抓住「按钮被整体挤到窗口外」。
+- **键盘事件要同时写进 `RawInput.modifiers`**。`Event::Key` 里带的 modifiers 只影响事件本身，`i.modifiers.command` 读的是帧级状态；只塞事件是拦不到 `Ctrl+` 系快捷键的。
+
 ## 技术要点
 
 - **UI**：egui / eframe 0.31，`show_viewport_immediate` 开子视口实现多原生窗口；`with_decorations(false)` + `ViewportCommand::{StartDrag, BeginResize, Minimized, Maximized, Close}` 全自绘
